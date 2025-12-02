@@ -1,0 +1,23 @@
+# Ignore only the backend virtual environment
+backend/.venv/
+data/
+ocr/
+frontend/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+backend/.env
+
+# Logs
+*.log
+
+# IDE folders
+.vscode/
+.idea/
+
+# OS
+.DS_Store
