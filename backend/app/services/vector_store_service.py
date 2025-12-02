@@ -2,14 +2,14 @@ import os
 import json
 import logging
 import time
-import math
 from typing import Dict, Any, List, Optional
 import cx_Oracle
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Configuration
+# ORACLE VECTOR DB CONFIG
+
 WALLET_PATH = os.getenv(
     "ORACLE_WALLET_PATH",
     r"C:\Users\shshrohi\Desktop\ai_rag_agent\backend\Wallet_POCSOLUTIONSATPDEV_Nov_2025"
@@ -25,6 +25,7 @@ VECTOR_DIM = int(os.getenv("VECTOR_DIM", "1536"))
 _pool: Optional[cx_Oracle.SessionPool] = None
 
 # Connection Pool
+
 def get_pool() -> cx_Oracle.SessionPool:
     global _pool
     if _pool is None:
@@ -38,74 +39,69 @@ def get_pool() -> cx_Oracle.SessionPool:
             increment=1,
             encoding="UTF-8",
             threaded=True,
-            getmode=cx_Oracle.SPOOL_ATTRVAL_WAIT
+            getmode=cx_Oracle.SPOOL_ATTRVAL_WAIT,
         )
         logger.info("Oracle SessionPool created.")
     return _pool
 
+
 def get_connection() -> cx_Oracle.Connection:
-    pool = get_pool()
-    return pool.acquire()
+    return get_pool().acquire()
+
 
 def close_pool():
     global _pool
     if _pool:
         try:
-            logger.info("Closing Oracle SessionPool...")
             _pool.close()
         except Exception as e:
             logger.exception("Error closing pool: %s", e)
         finally:
             _pool = None
 
-# Test Connection
-def test_connection(timeout_seconds: int = 5) -> Dict[str, Any]:
-    t0 = time.time()
+
+# Test connection
+def test_connection() -> Dict[str, Any]:
     try:
-        conn = cx_Oracle.connect(user=DB_USER, password=DB_PASSWORD, dsn=DB_TNS, encoding="UTF-8")
+        conn = cx_Oracle.connect(DB_USER, DB_PASSWORD, DB_TNS)
         cur = conn.cursor()
         cur.execute("SELECT USER FROM dual")
         row = cur.fetchone()
         cur.close()
         conn.close()
-        elapsed = round(time.time() - t0, 2)
-        return {"ok": True, "user": row[0] if row else None, "elapsed": elapsed}
+        return {"ok": True, "user": row[0]}
     except Exception as e:
-        logger.exception("test_connection failed")
-        return {"ok": False, "error": str(e), "elapsed": round(time.time() - t0, 2)}
+        return {"ok": False, "error": str(e)}
 
+# Insert single embedding
 def insert_embedding_record(chunk_text: str, embedding_vector: List[float], metadata: Dict[str, Any]):
     conn = get_connection()
     cur = conn.cursor()
 
-    metadata_json = json.dumps(metadata or {})
+    metadata_json = json.dumps(metadata)
 
     try:
-        vector_var = cur.arrayvar(cx_Oracle.NUMBER, embedding_vector)
+        # Oracle requires JSON array-like string for TO_VECTOR()
+        embedding_string = "[" + ",".join(map(str, embedding_vector)) + "]"
 
         cur.execute("""
             INSERT INTO ai_vector_store (chunk, embedding, metadata)
-            VALUES (:chunk, :embedding, :metadata)
+            VALUES (:chunk, TO_VECTOR(:embedding_string), :metadata)
         """, {
             "chunk": chunk_text,
-            "embedding": vector_var,
+            "embedding_string": embedding_string,
             "metadata": metadata_json
         })
 
         conn.commit()
-        logger.info("Inserted embedding chunk successfully.")
+        logger.info("Inserted embedding successfully.")
 
     finally:
         cur.close()
-        try:
-            pool = get_pool()
-            pool.release(conn)
-        except Exception:
-            conn.close()
+        get_pool().release(conn)
 
-# Insert embeddings from JSON file
-
-def insert_embeddings_from_json(json_file_path):
+# Insert multiple embeddings from JSON
+def insert_embeddings_from_json(json_file_path: str):
     conn = get_connection()
     cur = conn.cursor()
 
@@ -122,57 +118,64 @@ def insert_embeddings_from_json(json_file_path):
     """
 
     for entry in data:
-        chunk = entry["chunk"]
-        embedding_list = entry["embedding"]
-        metadata = json.dumps(entry.get("metadata", {}))
-
-        embedding_string = "[" + ",".join(str(v) for v in embedding_list) + "]"
-
+        embedding_string = "[" + ",".join(map(str, entry["embedding"])) + "]"
         cur.execute(sql, {
-            "chunk": chunk,
+            "chunk": entry["chunk"],
             "embedding_string": embedding_string,
-            "metadata": metadata
+            "metadata": json.dumps(entry.get("metadata", {}))
         })
 
     conn.commit()
     cur.close()
-    conn.close()
+    get_pool().release(conn)
+    logger.info("Batch embedding insert completed.")
 
+def search_similar_chunks(query_embedding: list, top_k: int = 5) -> list[dict]:
+    conn = None
+    cur = None
 
-def search_similar_chunks(query_embedding: list, top_k: int = 5, filters: dict = None):
-    conn = get_connection()
-    cur = conn.cursor()
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
 
-    query_embedding = normalize(query_embedding)
-    embedding_string = "[" + ",".join(str(v) for v in query_embedding) + "]"
+        cur.arraysize = top_k
+        cur.prefetchrows = top_k
 
-    filter_sql = ""
-    params = {"embedding_string": embedding_string, "top_k": top_k}
+        embedding_string = "[" + ",".join(str(v) for v in query_embedding) + "]"
 
-    if filters:
-        for key, value in filters.items():
-            filter_sql += f" AND JSON_VALUE(metadata, '$.{key}') = :{key} "
-            params[key] = value
+        sql = f"""
+            SELECT chunk, metadata
+            FROM ai_vector_store
+            ORDER BY embedding <=> TO_VECTOR(:embedding_string)
+            FETCH FIRST :top_k ROWS ONLY
+        """
 
-    sql = f"""
-        SELECT chunk, metadata
-        FROM ai_vector_store
-        WHERE 1=1 {filter_sql}
-        ORDER BY embedding <=> TO_VECTOR(:embedding_string)
-        FETCH FIRST :top_k ROWS ONLY
-    """
+        cur.execute(sql, embedding_string=embedding_string, top_k=top_k)
 
-    cur.execute(sql, params)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+        hits = []
 
-    result = []
-    for chunk, metadata_json in rows:
-        result.append({
-            "chunk": chunk.read() if hasattr(chunk, "read") else chunk,
-            "metadata": json.loads(metadata_json.read() if hasattr(metadata_json, "read") else metadata_json)
-        })
+        for chunk, metadata_json in cur:
+            # Convert chunk
+            if hasattr(chunk, "read"):
+                chunk_text = chunk.read()
+            else:
+                chunk_text = str(chunk)
 
-    return result
+            # Convert metadata
+            if hasattr(metadata_json, "read"):
+                metadata_text = metadata_json.read()
+            else:
+                metadata_text = str(metadata_json)
 
+            hits.append({
+                "chunk": chunk_text,
+                "metadata": json.loads(metadata_text)
+            })
+
+        return hits
+
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
